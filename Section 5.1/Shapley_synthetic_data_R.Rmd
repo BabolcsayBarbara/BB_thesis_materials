@@ -1,0 +1,739 @@
+---
+title: "Shapley_synthetic_R"
+author: "Babolcsay Barbara"
+date: "2025-05-02"
+output: html_document
+---
+
+```{r,warning=F}
+library(iml)
+library(fastshap)
+library(ggplot2)
+library(dplyr)
+library(kernelshap)
+library(treeshap)
+library(caret)
+library(xgboost)
+```
+
+## Experiment A - Linear Regression
+
+```{r}
+n_sim <- 20
+n <- 100   # smaller to keep runtime acceptable
+p <- 5
+sample_sizes <- c(25, 50, 100)
+
+# Save per-simulation feature-MSE result
+all_sim_mse <- list()
+
+for (sim in 1:n_sim) {
+  # Generate data
+  X <- as.data.frame(matrix(runif(n * p), nrow = n, ncol = p))
+  colnames(X) <- paste0("X", 1:p)
+  true_coefs <- c(1, 2, -1, 0, 0)
+  y <- as.vector(as.matrix(X) %*% true_coefs + rnorm(n, sd = 0.1))
+  
+  df <- X
+  df$y <- y
+  model_lm <- lm(y ~ ., data = df)
+  
+  # Theoretical SHAP
+  shap_theoretical <- function(x, coefs) {
+    means <- rep(0.5, length(x))
+    sweep(x, 2, means, "-") * matrix(coefs, nrow = nrow(x), ncol = length(coefs), byrow = TRUE)
+  }
+  
+  # Exhaustive SHAP
+  shap_exhaustive <- function(x, coefs, X_train) {
+    means <- colMeans(X_train)
+    sweep(x, 2, means, "-") * matrix(coefs, nrow = nrow(x), ncol = length(coefs), byrow = TRUE)
+  }
+
+  shap_theory_all <- shap_theoretical(X, true_coefs)
+  shap_exhaust_all <- shap_exhaustive(X, true_coefs, X)
+  
+  # iml sampling
+  predictor <- Predictor$new(model_lm, data = X, y = y)
+  shap_iml_all <- list()
+  for (s in sample_sizes) {
+    shap_vals <- lapply(1:n, function(i) {
+      shap_obj <- Shapley$new(predictor, x.interest = X[i, , drop = FALSE], sample.size = s)
+      shap_obj$results$phi
+    })
+    shap_iml_all[[as.character(s)]] <- do.call(rbind, shap_vals)
+  }
+
+  # fastshap
+  pred_fun <- function(object, newdata) {
+    predict(model_lm, newdata = newdata)
+  }
+
+  shap_fast_all <- list()
+  for (s in sample_sizes) {
+    shap_mat <- matrix(NA, nrow = n, ncol = p)
+    for (i in 1:n) {
+      x_row <- X[rep(i, 1), , drop = FALSE]
+      #print(x_row)
+      
+      shap_i <- fastshap:::explain.default(
+      object = NULL,
+      X = X,
+      pred_wrapper = pred_fun,
+      newdata = x_row,
+      nsim = s
+    )
+      shap_mat[i, ] <- as.numeric(shap_i)
+    }
+    shap_fast_all[[as.character(s)]] <- shap_mat
+  }
+  
+
+  # Kernel SHAP
+    shap_kernelshap_all <- list()
+    sample_sizes2 = c(100)
+    for (s in sample_sizes2) {
+      shap_matrix <- matrix(NA, nrow = n, ncol = p)  # Initialize matrix for SHAP values
+      for (i in 1:n) {
+        x_interest <- X[i, , drop = FALSE]  
+    
+        if (nrow(x_interest) != 1) {
+          stop("x_interest is not a 1-row matrix/data frame.")
+        }
+    
+        shap_res <- kernelshap(
+          object = model_lm,           
+          X = x_interest,             
+          bg_X = X,                    
+          #bg_n = s,                    
+          feature_names = colnames(X)  
+        )
+        
+        shap_matrix[i, ] <- shap_res$S 
+      }
+      shap_kernelshap_all[[as.character(s)]] <- shap_matrix  
+    }
+
+  # ==== MSE Calculation per Feature ====
+  feature_mse_df <- data.frame()
+  for (j in 1:p) {
+    f <- paste0("X", j)
+    mse_row <- data.frame(
+      Simulation = sim,
+      Feature = f,
+      Method = "Exhaustive",
+      SampleSize = NA,
+      MSE = mean((shap_exhaust_all[, j] - shap_theory_all[, j])^2)
+    )
+
+    for (s in sample_sizes) {
+      mse_row <- bind_rows(mse_row, data.frame(
+        Simulation = sim,
+        Feature = f,
+        Method = "imlSampling",
+        SampleSize = s,
+        MSE = mean((shap_iml_all[[as.character(s)]][, j] - shap_theory_all[, j])^2)
+      ))
+
+      mse_row <- bind_rows(mse_row, data.frame(
+        Simulation = sim,
+        Feature = f,
+        Method = "fastSHAP",
+        SampleSize = s,
+        MSE = mean((shap_fast_all[[as.character(s)]][, j] - shap_theory_all[, j])^2)
+      ))
+      
+      mse_row <- bind_rows(mse_row, data.frame(
+      Simulation = sim,
+      Feature = f,
+      Method = "KernelSHAP",
+      SampleSize = s,
+      MSE = mean((shap_kernelshap_all[[as.character(s)]][, j] - shap_theory_all[, j])^2)
+    ))
+    }
+
+    feature_mse_df <- bind_rows(feature_mse_df, mse_row)
+  }
+
+  all_sim_mse[[sim]] <- feature_mse_df
+  cat("Completed simulation", sim, "\n")
+}
+
+# Combine all simulation results
+final_mse_df <- bind_rows(all_sim_mse)
+#write.csv(final_mse_df, 'linreg_shapley_results_100_20.csv',row.names = F)
+```
+
+```{r}
+write.csv(final_mse_df,file='final_shapley_mse_linreg_100_20.csv',row.names=F)
+ordered_levels <- c("Exhaustive",
+                    "imlSampling-25", "imlSampling-50", "imlSampling-100",
+                    "fastSHAP-25", "fastSHAP-50", "fastSHAP-100",
+                    "KernelSHAP-100")
+
+final_mse_df2 <- final_mse_df %>%
+  mutate(MethodLabel = ifelse(is.na(SampleSize),
+                              Method,
+                              paste0(Method, "-", SampleSize))) %>%
+  mutate(MethodLabel = factor(MethodLabel, levels = ordered_levels))
+
+```
+
+```{r,fig.height=5,fig.width=10}
+# Plot
+ggplot(final_mse_df2, aes(x = MethodLabel, y = MSE, fill = MethodLabel)) +
+  geom_boxplot() +
+  facet_wrap(~ Feature, scales = "free_y") +
+  labs(title = "MSE of Shapley Estimates (Linear Regression)",
+       subtitle = "Sample size = 100, iterations = 20",
+       x = "Method", y = "MSE", fill = "Method") +
+  theme_minimal() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+  #theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# Experiment B - Logistic Regression
+
+we analize the feature value contribution to the log-odds
+
+```{r}
+set.seed(123)
+
+n_sim <- 20
+n <- 100
+p <- 5
+sample_sizes <- c(25, 50, 100)
+
+true_coefs <- c(1, 2, -1, 0, 0)
+all_sim_mse <- list()
+
+for (sim in 1:n_sim) {
+  # === 1. Generate classification data ===
+  X <- as.data.frame(matrix(runif(n * p), nrow = n, ncol = p))
+  colnames(X) <- paste0("X", 1:p)
+  logits <- as.vector(as.matrix(X) %*% true_coefs)
+  probs <- 1 / (1 + exp(-logits))
+  y <- rbinom(n, size = 1, prob = probs)
+  
+  df <- X
+  df$y <- y
+  model_glm <- glm(y ~ ., data = df, family = binomial)
+
+  # === 2. SHAP functions for log-odds scale ===
+  shap_theoretical <- function(x, coefs) {
+    means <- rep(0.5, length(x))  # Uniform(0,1) mean
+    sweep(x, 2, means, "-") * matrix(coefs, nrow = nrow(x), ncol = length(coefs), byrow = TRUE)
+  }
+  
+  shap_exhaustive <- function(x, coefs, X_train) {
+    means <- colMeans(X_train)
+    sweep(x, 2, means, "-") * matrix(coefs, nrow = nrow(x), ncol = length(coefs), byrow = TRUE)
+  }
+
+  coefs_glm <- coef(model_glm)[-1]
+
+  # Predicted log-odds (not probabilities)
+  shap_theory_all <- shap_theoretical(X, coefs_glm)
+  shap_exhaust_all <- shap_exhaustive(X, coefs_glm, X)
+
+  # === 3. Sampling SHAP (iml) ===
+  predictor <- Predictor$new(model_glm, data = X, y = y, predict.fun = function(m, newdata) {
+    predict(m, newdata = newdata, type = "link")
+  })
+  
+  shap_iml_all <- list()
+  for (s in sample_sizes) {
+    shap_vals <- lapply(1:n, function(i) {
+      shap_obj <- Shapley$new(predictor, x.interest = X[i, , drop = FALSE], sample.size = s)
+      shap_obj$results$phi
+    })
+    shap_iml_all[[as.character(s)]] <- do.call(rbind, shap_vals)
+  }
+
+  # === 4. fastshap ===
+  pred_fun <- function(object, newdata) {
+    predict(model_glm, newdata = newdata, type = "link")
+  }
+
+  shap_fast_all <- list()
+  for (s in sample_sizes) {
+    shap_mat <- matrix(NA, nrow = n, ncol = p)
+    for (i in 1:n) {
+      x_row <- X[rep(i, 1), , drop = FALSE]
+      shap_i <- fastshap:::explain.default(
+        object = NULL,
+        X = X,
+        pred_wrapper = pred_fun,
+        newdata = x_row,
+        nsim = s
+      )
+      shap_mat[i, ] <- as.numeric(shap_i)
+    }
+    shap_fast_all[[as.character(s)]] <- shap_mat
+  }
+
+  # === 5. Kernel SHAP ===
+  shap_kernelshap_all <- list()
+  sample_sizes2 <- c(100)  
+  for (s in sample_sizes2) {
+    shap_matrix <- matrix(NA, nrow = n, ncol = p)
+    for (i in 1:n) {
+      x_interest <- X[i, , drop = FALSE]
+
+      shap_res <- kernelshap(
+        object = model_glm,
+        X = x_interest,
+        bg_X = X,  
+        feature_names = colnames(X),
+        pred_fun = function(object, newdata) {
+          predict(object, newdata = newdata, type = "link")
+        }
+      )
+
+      shap_matrix[i, ] <- shap_res$S
+    }
+    shap_kernelshap_all[[as.character(s)]] <- shap_matrix
+  }
+
+  # === 6. MSE per feature ===
+  feature_mse_df <- data.frame()
+  for (j in 1:p) {
+    f <- paste0("X", j)
+    mse_row <- data.frame(
+      Simulation = sim,
+      Feature = f,
+      Method = "Exhaustive",
+      SampleSize = NA,
+      MSE = mean((shap_exhaust_all[, j] - shap_theory_all[, j])^2)
+    )
+    
+    for (s in sample_sizes) {
+      mse_row <- bind_rows(mse_row, data.frame(
+        Simulation = sim,
+        Feature = f,
+        Method = "imlSampling",
+        SampleSize = s,
+        MSE = mean((shap_iml_all[[as.character(s)]][, j] - shap_theory_all[, j])^2)
+      ))
+      mse_row <- bind_rows(mse_row, data.frame(
+        Simulation = sim,
+        Feature = f,
+        Method = "fastSHAP",
+        SampleSize = s,
+        MSE = mean((shap_fast_all[[as.character(s)]][, j] - shap_theory_all[, j])^2)
+      ))
+    }
+
+    # Add kernelshap MSE (only for sample_sizes2)
+    for (s in sample_sizes2) {
+      mse_row <- bind_rows(mse_row, data.frame(
+        Simulation = sim,
+        Feature = f,
+        Method = "KernelSHAP",
+        SampleSize = s,
+        MSE = mean((shap_kernelshap_all[[as.character(s)]][, j] - shap_theory_all[, j])^2)
+      ))
+    }
+
+    feature_mse_df <- bind_rows(feature_mse_df, mse_row)
+  }
+
+  all_sim_mse[[sim]] <- feature_mse_df
+  cat("Completed simulation", sim, "\n")
+}
+
+# === 7. Combine and plot ===
+final_mse_df <- bind_rows(all_sim_mse)
+#final_mse_df$Feature <- factor(final_mse_df$Feature, levels = paste0("X", 1:p))
+#write.csv(final_mse_df, 'logreg_shapley_results_100_20_with_kernelshap.csv', row.names = FALSE)
+
+```
+
+
+```{r}
+write.csv(final_mse_df,file='final_shapley_mse_logreg_100_20.csv',row.names=F)
+ordered_levels <- c("Exhaustive",
+                    "imlSampling-25", "imlSampling-50", "imlSampling-100",
+                    "fastSHAP-25", "fastSHAP-50", "fastSHAP-100","KernelSHAP-100")
+
+final_mse_df3 <- final_mse_df %>%
+  mutate(MethodLabel = ifelse(is.na(SampleSize),
+                              Method,
+                              paste0(Method, "-", SampleSize))) %>%
+  mutate(MethodLabel = factor(MethodLabel, levels = ordered_levels))
+
+```
+
+```{r,fig.height=5,fig.width=10}
+# Plot
+ggplot(final_mse_df3, aes(x = MethodLabel, y = MSE, fill = MethodLabel)) +
+  geom_boxplot() +
+  facet_wrap(~ Feature, scales = "free_y") +
+  labs(title = "MSE of Shapley Estimates (Logistic Regression)",
+       subtitle = "Sample size = 100, iterations = 20",
+       x = "Method", y = "MSE", fill = "Method") +
+  theme_minimal() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+  #theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Experiment C - Tree-based methods
+
+### 1. XGBoost
+
+```{r}
+n_sim <- 20
+n <- 100
+p <- 5
+sample_sizes <- c(25, 50, 100)
+
+# Results for all simulations
+all_sim_mse <- list()
+
+for (sim in 1:n_sim) {
+  # Generate synthetic data
+  X <- as.data.frame(matrix(runif(n * p), nrow = n, ncol = p))
+  colnames(X) <- paste0("X", 1:p)
+  true_coefs <- c(1, 2, -1, 0, 0)
+  y <- as.vector(as.matrix(X) %*% true_coefs + rnorm(n, sd = 0.1))
+  df <- X
+  df$y <- y
+  
+  # Train XGBoost model using caret
+  fit_control <- trainControl(method = "cv", number = 5)
+  model_xgb <- train(y ~ ., data = df, method = "xgbTree", trControl = fit_control)
+  
+  # Predictor for iml (Shapley values)
+  predictor <- Predictor$new(model_xgb, data = X, y = y)
+  shap_iml_all <- list()
+  for (s in sample_sizes) {
+    shap_vals <- lapply(1:n, function(i) {
+      shap_obj <- Shapley$new(predictor, x.interest = X[i, , drop = FALSE], sample.size = s)
+      shap_obj$results$phi
+    })
+    shap_iml_all[[as.character(s)]] <- do.call(rbind, shap_vals)
+  }
+
+  # Function for fastSHAP
+  pred_fun <- function(object, newdata) {
+    predict(object, newdata = as.data.frame(newdata))
+  }
+
+  shap_fast_all <- list()
+  for (s in sample_sizes) {
+    shap_mat <- matrix(NA, nrow = n, ncol = p)
+    for (i in 1:n) {
+      x_row <- X[rep(i, 1), , drop = FALSE]
+      shap_i <- fastshap:::explain.default(
+        object = model_xgb,
+        X = as.data.frame(X),
+        pred_wrapper = pred_fun,
+        newdata = as.data.frame(x_row),
+        nsim = s
+      )
+      shap_mat[i, ] <- as.numeric(shap_i)
+    }
+    shap_fast_all[[as.character(s)]] <- shap_mat
+  }
+  
+  # TreeSHAP calculation
+  xgb_booster <- model_xgb$finalModel
+  dtrain <- xgb.DMatrix(as.matrix(X), label = y)
+  unified_model <- xgboost.unify(xgb_booster, as.matrix(X))
+  shap_treeshap_model <- treeshap(unified_model, X)
+  shap_treeshap <- shap_treeshap_model$shaps
+
+  # KernelSHAP calculation
+  shap_kernelshap_all <- list()
+  sample_sizes2 = 100
+  for (s in sample_sizes2) {
+    shap_matrix <- matrix(NA, nrow = n, ncol = p)
+    for (i in 1:n) {
+      x_interest <- X[i, , drop = FALSE]
+      shap_res <- kernelshap(
+        object = model_xgb,
+        X = x_interest,
+        bg_X = X,
+        feature_names = colnames(X)
+      )
+      shap_matrix[i, ] <- shap_res$S
+    }
+    shap_kernelshap_all[[as.character(s)]] <- shap_matrix
+  }
+
+  # MSE Calculation
+  feature_mse_df <- data.frame()
+  for (j in 1:p) {
+    f <- paste0("X", j)
+    
+    base_ref <- shap_kernelshap_all[["100"]][, j]  # Reference: KernelSHAP-100
+
+    # Initial MSE for KernelSHAP-100
+    mse_row <- data.frame(
+      Simulation = sim,
+      Feature = f,
+      Method = "kernelSHAP-100",
+      SampleSize = 100,
+      MSE = mean((base_ref - base_ref)^2)
+    )
+
+    # MSE for imlSampling, fastSHAP, kernelSHAP
+    for (s in sample_sizes) {
+      mse_row <- bind_rows(mse_row, data.frame(
+        Simulation = sim,
+        Feature = f,
+        Method = "imlSampling",
+        SampleSize = s,
+        MSE = mean((shap_iml_all[[as.character(s)]][, j] - base_ref)^2)
+      ))
+
+      mse_row <- bind_rows(mse_row, data.frame(
+        Simulation = sim,
+        Feature = f,
+        Method = "fastSHAP",
+        SampleSize = s,
+        MSE = mean((shap_fast_all[[as.character(s)]][, j] - base_ref)^2)
+      ))
+
+      mse_row <- bind_rows(mse_row, data.frame(
+        Simulation = sim,
+        Feature = f,
+        Method = "kernelSHAP",
+        SampleSize = s,
+        MSE = mean((shap_kernelshap_all[[as.character(s)]][, j] - base_ref)^2)
+      ))
+    }
+
+    # MSE for TreeSHAP (no sample size concept)
+    mse_row <- bind_rows(mse_row, data.frame(
+      Simulation = sim,
+      Feature = f,
+      Method = "treeSHAP",
+      SampleSize = NA,
+      MSE = mean((shap_treeshap[, j] - base_ref)^2)
+    ))
+
+    feature_mse_df <- bind_rows(feature_mse_df, mse_row)
+  }
+
+  # Store the results for the current simulation
+  all_sim_mse[[sim]] <- feature_mse_df
+  cat("Completed simulation", sim, "\n")
+}
+
+# Combine results across all simulations
+final_mse_df <- bind_rows(all_sim_mse)
+write.csv(final_mse_df,file='final_shapley_mse_xgboost_100_20.csv',row.names = F)
+```
+
+```{r}
+ordered_levels <- c("imlSampling-25", "imlSampling-50", "imlSampling-100",
+                    "fastSHAP-25", "fastSHAP-50", "fastSHAP-100",
+                    "treeSHAP")#, "kernelSHAP-100")
+
+final_mse_df4 <- final_mse_df %>%
+  mutate(MethodLabel = ifelse(is.na(SampleSize),
+                              Method,
+                              paste0(Method, "-", SampleSize))) %>%
+  mutate(MethodLabel = factor(MethodLabel, levels = ordered_levels)) %>%
+  filter(!is.na(MethodLabel)) %>%
+  filter(MSE != 'NaN')
+
+
+```
+
+```{r,fig.height=5,fig.width=10}
+# Plot
+ggplot(final_mse_df4, aes(x = MethodLabel, y = MSE, fill = MethodLabel)) +
+  geom_boxplot() +
+  facet_wrap(~ Feature, scales = "free_y") +
+  labs(title = "MSE of Shapley Estimates (XGBoost) - Compared to KernelSHAP-100",
+       subtitle = "Sample size = 100, iterations = 20",
+       x = "Method", y = "MSE", fill = "Method") +
+  coord_cartesian(ylim = c(0, NA)) +
+  theme_minimal() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+  #theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+### 2. Random Forest 
+
+```{r}
+n_sim <- 20
+n <- 100
+p <- 5
+sample_sizes <- c(25, 50, 100)
+
+# Results for all simulations
+all_sim_mse <- list()
+
+for (sim in 1:n_sim) {
+  # Generate synthetic data
+  X <- as.data.frame(matrix(runif(n * p), nrow = n, ncol = p))
+  colnames(X) <- paste0("X", 1:p)
+  true_coefs <- c(1, 2, -1, 0, 0)
+  y <- as.vector(as.matrix(X) %*% true_coefs + rnorm(n, sd = 0.1))
+  df <- X
+  df$y <- y
+  
+  # Train Random Forest using caret
+  fit_control <- trainControl(method = "cv", number = 5)
+  model_rf <- train(y ~ ., data = df, method = "rf", trControl = fit_control)
+  
+  # Predictor for iml
+  predictor <- Predictor$new(model_rf, data = X, y = y)
+  shap_iml_all <- list()
+  for (s in sample_sizes) {
+    shap_vals <- lapply(1:n, function(i) {
+      shap_obj <- Shapley$new(predictor, x.interest = X[i, , drop = FALSE], sample.size = s)
+      shap_obj$results$phi
+    })
+    shap_iml_all[[as.character(s)]] <- do.call(rbind, shap_vals)
+  }
+
+  # Fastshap
+  pred_fun <- function(object, newdata) {
+    predict(object, newdata = as.data.frame(newdata))
+  }
+
+  shap_fast_all <- list()
+  for (s in sample_sizes) {
+    shap_mat <- matrix(NA, nrow = n, ncol = p)
+    for (i in 1:n) {
+      x_row <- X[rep(i, 1), , drop = FALSE]
+      shap_i <- fastshap:::explain.default(
+        object = model_rf,
+        X = as.data.frame(X),
+        pred_wrapper = pred_fun,
+        newdata = as.data.frame(x_row),
+        nsim = s
+      )
+      shap_mat[i, ] <- as.numeric(shap_i)
+    }
+    shap_fast_all[[as.character(s)]] <- shap_mat
+  }
+
+  # KernelSHAP
+  shap_kernelshap_all <- list()
+  sample_sizes2 = 100  # only for reference
+  for (s in sample_sizes2) {
+    shap_matrix <- matrix(NA, nrow = n, ncol = p)
+    for (i in 1:n) {
+      x_interest <- X[i, , drop = FALSE]
+      shap_res <- kernelshap(
+        object = model_rf,
+        X = x_interest,
+        bg_X = X,
+        feature_names = colnames(X)
+      )
+      shap_matrix[i, ] <- shap_res$S
+    }
+    shap_kernelshap_all[[as.character(s)]] <- shap_matrix
+  }
+
+  # TreeSHAP for Random Forest
+  unified_model <- randomForest.unify(model_rf$finalModel, X)
+  shap_treeshap_model <- treeshap(unified_model, X)
+  shap_treeshap <- shap_treeshap_model$shaps
+
+  # MSE Calculation
+  feature_mse_df <- data.frame()
+  for (j in 1:p) {
+    f <- paste0("X", j)
+    
+    base_ref <- shap_kernelshap_all[["100"]][, j]  # Reference: KernelSHAP-100
+
+    # Initial MSE for KernelSHAP-100
+    mse_row <- data.frame(
+      Simulation = sim,
+      Feature = f,
+      Method = "kernelSHAP-100",
+      SampleSize = 100,
+      MSE = mean((base_ref - base_ref)^2)
+    )
+
+    # MSE for imlSampling, fastSHAP, kernelSHAP
+    for (s in sample_sizes) {
+      mse_row <- bind_rows(mse_row, data.frame(
+        Simulation = sim,
+        Feature = f,
+        Method = "imlSampling",
+        SampleSize = s,
+        MSE = mean((shap_iml_all[[as.character(s)]][, j] - base_ref)^2)
+      ))
+
+      mse_row <- bind_rows(mse_row, data.frame(
+        Simulation = sim,
+        Feature = f,
+        Method = "fastSHAP",
+        SampleSize = s,
+        MSE = mean((shap_fast_all[[as.character(s)]][, j] - base_ref)^2)
+      ))
+
+      mse_row <- bind_rows(mse_row, data.frame(
+        Simulation = sim,
+        Feature = f,
+        Method = "kernelSHAP",
+        SampleSize = s,
+        MSE = mean((shap_kernelshap_all[[as.character(s)]][, j] - base_ref)^2)
+      ))
+    }
+
+    # MSE for TreeSHAP
+    mse_row <- bind_rows(mse_row, data.frame(
+      Simulation = sim,
+      Feature = f,
+      Method = "treeSHAP",
+      SampleSize = NA,
+      MSE = mean((shap_treeshap[, j] - base_ref)^2)
+    ))
+
+    feature_mse_df <- bind_rows(feature_mse_df, mse_row)
+  }
+
+  # Simulation results
+  all_sim_mse[[sim]] <- feature_mse_df
+  cat("Completed simulation", sim, "\n")
+}
+
+# Combine results across simulations
+final_mse_df <- bind_rows(all_sim_mse)
+
+# Save to file
+write.csv(final_mse_df, file = 'final_shapley_mse_randomforest_100_20.csv', row.names = FALSE)
+
+```
+```{r}
+ordered_levels <- c("imlSampling-25", "imlSampling-50", "imlSampling-100",
+                    "fastSHAP-25", "fastSHAP-50", "fastSHAP-100",
+                    "treeSHAP")#, "kernelSHAP-100")
+
+final_mse_df5 <- final_mse_df %>%
+  mutate(MethodLabel = ifelse(is.na(SampleSize),
+                              Method,
+                              paste0(Method, "-", SampleSize))) %>%
+  mutate(MethodLabel = factor(MethodLabel, levels = ordered_levels)) %>%
+  filter(!is.na(MethodLabel)) %>%
+  filter(MSE != 'NaN')
+
+```
+
+```{r,fig.height=5,fig.width=10}
+# Plot
+ggplot(final_mse_df5, aes(x = MethodLabel, y = MSE, fill = MethodLabel)) +
+  geom_boxplot() +
+  facet_wrap(~ Feature, scales = "free_y") +
+  labs(title = "MSE of Shapley Estimates (Random Forest) - Compared to KernelSHAP-100",
+       subtitle = "Sample size = 100, iterations = 20",
+       x = "Method", y = "MSE", fill = "Method") +
+  coord_cartesian(ylim = c(0, NA)) +
+  theme_minimal() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+  #theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
